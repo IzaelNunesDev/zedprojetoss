@@ -62,7 +62,11 @@ async def handle_join_game(game_id: str, player_id: str):
 
     if len(game.players) == 2: # Define o número de jogadores para iniciar
         game.start_game()
+        # Após o início, envia o estado público a todos
         await connection_manager.broadcast(game_id, {"type": "GAME_START", "payload": game.get_public_state()})
+        # E o estado privado para cada um
+        for pid in game.players:
+            await connection_manager.send_to_player(game_id, pid, {"type": "PRIVATE_STATE", "payload": game.get_private_state(pid)})
 
     return {"message": f"Player {player_id} joined game {game_id}"}
 
@@ -75,36 +79,32 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
         return
 
     await connection_manager.connect(websocket, game_id, player_id)
-    # Envia o estado privado inicial
     await connection_manager.send_to_player(game_id, player_id, {"type": "PRIVATE_STATE", "payload": game.get_private_state(player_id)})
 
     try:
         while True:
             data = await websocket.receive_json()
             message_type = data.get("type")
-            payload = data.get("payload")
+            payload = data.get("payload", {})
 
             if message_type == "PLAYER_ACTION" and game.current_turn_player_id == player_id:
                 game.handle_action(player_id, payload)
 
             elif message_type == "ACTION_RESPONSE":
-                game.resolve_pending_action(player_id, payload.get("contested", False))
+                ### MUDANÇA FINAL: Passando o payload inteiro
+                game.resolve_pending_action(player_id, payload)
 
-            ### MUDANÇA: Novo tipo de mensagem para quando um jogador escolhe uma carta
             elif message_type == "CHOOSE_MONSTER" and game.player_to_choose == player_id:
                 game.handle_player_choice(player_id, payload.get("monster_name"))
 
             else:
                 await connection_manager.send_to_player(game_id, player_id, {"type": "ERROR", "message": "Invalid action or not your turn."})
-                continue # Pula o broadcast se a ação for inválida
+                continue
 
-            # Após qualquer ação válida, notifica todos sobre o novo estado
-            await connection_manager.broadcast(game_id, {"type": "GAME_STATE_UPDATE", "payload": game.get_public_state()})
-
-            # Envia estado privado atualizado para cada jogador
+            # Otimização: Em vez de broadcast + loop de send_to_player,
+            # apenas o loop já é suficiente pois o estado privado contém o público.
             for pid in game.players:
-                await connection_manager.send_to_player(game_id, pid, {"type": "PRIVATE_STATE", "payload": game.get_private_state(pid)})
-
+                await connection_manager.send_to_player(game_id, pid, {"type": "GAME_STATE_UPDATE", "payload": game.get_private_state(pid)})
 
     except WebSocketDisconnect:
         connection_manager.disconnect(game_id, player_id)

@@ -3,14 +3,14 @@ import random
 from typing import List, Dict
 from enum import Enum
 
-### MUDANÇA: Usando Enum para estados de jogo mais seguros.
 class GameState(str, Enum):
     WAITING_FOR_PLAYERS = "WAITING_FOR_PLAYERS"
     IN_PROGRESS = "IN_PROGRESS"
     AWAITING_RESPONSE = "AWAITING_RESPONSE"
-    AWAITING_CHOICE = "AWAITING_CHOICE" # Estado para esperar a escolha do jogador
+    AWAITING_CHOICE = "AWAITING_CHOICE"
     FINISHED = "FINISHED"
 
+# ... (Classes Monster, Deck, Player continuam as mesmas) ...
 class Monster:
     def __init__(self, name: str, ability: str):
         self.name = name
@@ -55,6 +55,7 @@ class Player:
             return True
         return False
 
+
 class Game:
     def __init__(self, game_id: str):
         self.id = game_id
@@ -62,11 +63,10 @@ class Game:
         self.deck = Deck()
         self.current_turn_player_id: str = None
         self.game_state: GameState = GameState.WAITING_FOR_PLAYERS
-
         self.pending_action: Dict | None = None
-        ### MUDANÇA: Atributo para guardar quem precisa fazer uma escolha.
         self.player_to_choose: str | None = None
 
+    # ... (add_player, start_game, _check_for_winner são os mesmos) ...
     def add_player(self, player_id: str) -> bool:
         if player_id not in self.players and len(self.players) < 2:
             player = Player(player_id)
@@ -85,13 +85,12 @@ class Game:
             self.game_state = GameState.IN_PROGRESS
 
     def next_turn(self):
+        # ... (lógica de next_turn é a mesma) ...
         player_ids = list(self.players.keys())
-        # Garante que apenas jogadores com monstros restantes possam jogar
         active_player_ids = [pid for pid, p in self.players.items() if len(p.monsters) > 0]
         if not active_player_ids or self.current_turn_player_id not in active_player_ids:
              self._check_for_winner()
              return
-
         current_index = active_player_ids.index(self.current_turn_player_id)
         next_index = (current_index + 1) % len(active_player_ids)
         self.current_turn_player_id = active_player_ids[next_index]
@@ -102,15 +101,26 @@ class Game:
             self.game_state = GameState.FINISHED
             print(f"Game Over! Winner is {active_players[0].id if active_players else 'None'}")
 
+
     def handle_action(self, player_id: str, action_data: dict):
+        ### MUDANÇA FINAL: Trava de segurança
+        if self.game_state != GameState.IN_PROGRESS: return
+
         action_name = action_data.get("action")
         player = self.players[player_id]
 
-        # Ações que não podem ser contestadas
-        if action_name in ["Treinar", "Caçar"]:
-            if action_name == "Treinar": player.coins += 1
-            if action_name == "Caçar": player.coins += 2
+        if action_name == "Treinar":
+            player.coins += 1
             self.next_turn()
+            return
+
+        ### MUDANÇA FINAL: Caçar agora pode ser bloqueado
+        if action_name == "Caçar":
+            self.game_state = GameState.AWAITING_RESPONSE
+            self.pending_action = {
+                "action": "Caçar",
+                "source_player_id": player_id
+            }
             return
 
         if action_name == "Golpe Final":
@@ -119,7 +129,6 @@ class Game:
                 player.coins -= 7
                 self.game_state = GameState.AWAITING_CHOICE
                 self.player_to_choose = target_id
-                # O broadcast no main.py irá notificar o alvo para escolher
             return
 
         # Ações de Monstro (que podem ser contestadas)
@@ -130,44 +139,58 @@ class Game:
             "target_player_id": action_data.get("target_player_id")
         }
 
-    def resolve_pending_action(self, responding_player_id: str, contested: bool):
-        if not self.pending_action: return
+    def resolve_pending_action(self, responding_player_id: str, response_data: dict):
+        ### MUDANÇA FINAL: Trava de segurança
+        if self.game_state != GameState.AWAITING_RESPONSE: return
+
+        contested = response_data.get("contested", False)
+        block_with = response_data.get("block_with") # Ex: "Golem"
 
         source_player = self.players[self.pending_action["source_player_id"]]
         action_monster = self.pending_action["action"]
 
+        ### MUDANÇA FINAL: Lógica para bloqueio (ex: com Golem)
+        if block_with:
+            # O jogador declara que está bloqueando com um monstro. Isso pode ser contestado!
+            # Para simplificar, vamos assumir que o bloqueio não pode ser contestado.
+            # Se o bloqueio for válido (ex: Golem bloqueando Caçar), a ação é cancelada.
+            if action_monster == "Caçar" and block_with == "Golem":
+                # Ação cancelada. Turno passa.
+                self.pending_action = None
+                self.game_state = GameState.IN_PROGRESS
+                self.next_turn()
+                return
+
         if not contested:
             self._execute_monster_ability(source_player, self.pending_action)
         else:
+            # A lógica de contestação continua a mesma...
             has_monster = any(m.name == action_monster for m in source_player.monsters)
             if has_monster:
-                # O contestador perdeu, precisa escolher uma carta para perder
                 self.game_state = GameState.AWAITING_CHOICE
                 self.player_to_choose = responding_player_id
-                # Troca a carta do jogador que provou
                 monster_to_swap = next(m for m in source_player.monsters if m.name == action_monster)
                 source_player.monsters.remove(monster_to_swap)
                 new_card = self.deck.draw()
                 if new_card: source_player.monsters.append(new_card)
                 self.deck.cards.append(monster_to_swap)
                 self.deck.shuffle()
-                # A ação original ainda acontece depois que o contestador perder a carta
             else:
-                # O blefador foi pego, precisa escolher uma carta para perder
                 self.game_state = GameState.AWAITING_CHOICE
                 self.player_to_choose = source_player.id
-                # A ação é cancelada
-                self.pending_action = None
+                self.pending_action = None # Ação cancelada
 
-    ### MUDANÇA: Nova função para lidar com a escolha de uma carta
     def handle_player_choice(self, player_id: str, monster_name: str):
+        ### MUDANÇA FINAL: Trava de segurança
         if self.game_state != GameState.AWAITING_CHOICE or self.player_to_choose != player_id:
             return
 
         player = self.players[player_id]
-        player.lose_monster(monster_name)
+        if not player.lose_monster(monster_name):
+            # O jogador tentou escolher uma carta que não tem, vamos apenas remover a primeira.
+            if player.monsters:
+                player.lose_monster(player.monsters[0].name)
 
-        # Se a escolha foi resultado de uma contestação ganha, a ação original acontece agora
         if self.pending_action:
              source_player = self.players[self.pending_action["source_player_id"]]
              self._execute_monster_ability(source_player, self.pending_action)
@@ -180,10 +203,15 @@ class Game:
             self.next_turn()
 
     def _execute_monster_ability(self, source_player: Player, action_data: dict):
-        action = action_data["action"]
+        action = action_data.get("action")
         target_id = action_data.get("target_player_id")
 
-        if action == "Dragão" and target_id:
+        # Não executa nada se não houver ação (caso de contestação perdida)
+        if not action: return
+
+        if action == "Caçar": # Se não foi bloqueado
+            source_player.coins += 2
+        elif action == "Dragão" and target_id:
             self.game_state = GameState.AWAITING_CHOICE
             self.player_to_choose = target_id
         elif action == "Espectro" and target_id:
@@ -193,19 +221,14 @@ class Game:
             source_player.coins += stolen
         elif action == "Slime":
             source_player.coins += 3
+        ### MUDANÇA FINAL: Falcão agora depende de escolha
         elif action == "Falcão":
-            # Simplificação: troca a primeira carta do jogador.
-            if source_player.monsters:
-                card_to_swap = source_player.monsters[0]
-                source_player.monsters.remove(card_to_swap)
-                new_card = self.deck.draw()
-                if new_card:
-                    source_player.monsters.append(new_card)
-                self.deck.cards.append(card_to_swap)
-                self.deck.shuffle()
-        # A habilidade do Golem (bloqueio) é reativa e precisa de uma mudança
-        # na arquitetura para ser implementada, tratando de respostas a ações.
+            self.game_state = GameState.AWAITING_CHOICE
+            self.player_to_choose = source_player.id
+            # A lógica da troca será feita em handle_player_choice para o Falcão
+            self.pending_action['is_swap'] = True # Adiciona um marcador
 
+    # ... (get_private_state e get_public_state são os mesmos) ...
     def get_private_state(self, player_id: str) -> dict:
         player = self.players.get(player_id)
         if not player: return {}
