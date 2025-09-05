@@ -4,7 +4,7 @@ from typing import Dict, List
 import json
 
 from .core.game_manager import game_manager
-from .core.models import Player
+
 
 app = FastAPI()
 
@@ -49,11 +49,8 @@ async def handle_join_game(game_id: str, player_id: str):
     if game.game_state != "WAITING_FOR_PLAYERS":
         raise HTTPException(status_code=400, detail="Game has already started")
 
-    if player_id in game.players:
-        raise HTTPException(status_code=400, detail="Player ID already exists in this game")
-
-    player = Player(player_id)
-    game.add_player(player)
+    if not game.add_player(player_id):
+        raise HTTPException(status_code=400, detail="Player ID already exists in this game or game is full.")
 
     # Notifica todos os jogadores sobre o novo jogador
     await connection_manager.broadcast(game_id, {"type": "PLAYER_JOINED", "payload": game.get_public_state()})
@@ -67,9 +64,6 @@ async def handle_join_game(game_id: str, player_id: str):
 
 @app.websocket("/ws/{game_id}/{player_id}")
 async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str):
-    """
-    Endpoint WebSocket para comunicação em tempo real durante o jogo.
-    """
     game = game_manager.get_game(game_id)
     if not game or player_id not in game.players:
         await websocket.close(code=1008)
@@ -77,25 +71,40 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
 
     await connection_manager.connect(websocket, game_id)
 
-    # Envia o estado atual para o jogador que acabou de se conectar
-    await websocket.send_json({"type": "GAME_STATE", "payload": game.get_public_state()})
+    # Envia o estado privado para o jogador que acabou de se conectar
+    await websocket.send_json({"type": "PRIVATE_STATE", "payload": game.get_private_state(player_id)})
 
     try:
         while True:
             data = await websocket.receive_json()
-            # Ex: {"type": "ACTION", "payload": {"action": "Treinar"}}
+            # Ex: {"type": "PLAYER_ACTION", "payload": {"action": "Dragão", "target_player_id": "p2"}}
+            # Ex: {"type": "ACTION_RESPONSE", "payload": {"contest": true}}
 
-            # Valida se é a vez do jogador
-            if game.current_turn_player_id == player_id:
-                game.handle_action(player_id, data.get("payload"))
+            message_type = data.get("type")
+            payload = data.get("payload")
 
-                # Após a ação, atualiza o estado para todos
-                await connection_manager.broadcast(game_id, {"type": "GAME_STATE_UPDATE", "payload": game.get_public_state()})
+            if message_type == "PLAYER_ACTION" and game.current_turn_player_id == player_id:
+                game.handle_action(player_id, payload)
+
+                if game.game_state == "AWAITING_RESPONSE":
+                    # Notifica todos que uma ação foi declarada
+                    await connection_manager.broadcast(game_id, {"type": "ACTION_DECLARED", "payload": game.pending_action})
+                else:
+                    # Ação foi resolvida instantaneamente (Treinar, etc)
+                    await connection_manager.broadcast(game_id, {"type": "GAME_STATE_UPDATE", "payload": game.get_public_state()})
+
+            elif message_type == "ACTION_RESPONSE":
+                # Um jogador está respondendo a uma ação (contestando ou não)
+                game.resolve_pending_action(player_id, payload.get("contested", False))
+
+                if game.game_state == "FINISHED":
+                     await connection_manager.broadcast(game_id, {"type": "GAME_OVER", "payload": game.get_public_state()})
+                else:
+                     await connection_manager.broadcast(game_id, {"type": "GAME_STATE_UPDATE", "payload": game.get_public_state()})
+
             else:
-                # Informa ao jogador que não é sua vez
-                await websocket.send_json({"type": "ERROR", "message": "Not your turn"})
+                await websocket.send_json({"type": "ERROR", "message": "Invalid action or not your turn."})
 
     except WebSocketDisconnect:
         connection_manager.disconnect(websocket, game_id)
-        # Opcional: Lógica para lidar com a desconexão de um jogador (pausar o jogo, etc.)
         await connection_manager.broadcast(game_id, {"type": "PLAYER_DISCONNECTED", "player_id": player_id})
